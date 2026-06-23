@@ -1,0 +1,120 @@
+name: 每日抓取股市資料
+
+on:
+  schedule:
+    - cron: '30 9 * * 1-5'  # 台灣時間 17:30，UTC 09:30，週一到週五
+  workflow_dispatch:          # 允許手動觸發
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 抓取股市資料並產生 data.json
+        run: |
+          python3 << 'PYEOF'
+          import json, time, datetime, urllib.request
+
+          SYMBOLS = ["2330","2317","2454","2881","2382"]
+          HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+          def fetch(url):
+              req = urllib.request.Request(url, headers=HEADERS)
+              with urllib.request.urlopen(req, timeout=15) as r:
+                  return json.loads(r.read())
+
+          def today(): return datetime.date.today().strftime("%Y%m%d")
+          def month(): return datetime.date.today().strftime("%Y%m01")
+
+          result = {}
+          for sym in SYMBOLS:
+              print(f"Fetching {sym}...")
+              try:
+                  # 股價
+                  d = fetch(f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={month()}&stockNo={sym}")
+                  rows = d.get("data", [])
+                  if len(rows) < 2:
+                      print(f"  skip {sym}")
+                      continue
+                  p = lambda v: float(v.replace(",","")) if v and v.strip() not in ["--",""] else 0
+                  price = p(rows[-1][6])
+                  prev  = p(rows[-2][6])
+                  week  = p(rows[max(0,len(rows)-6)][6])
+                  chg   = round(p(rows[-1][7]) or price-prev, 2)
+                  result[sym] = {
+                      "price": price,
+                      "change": chg,
+                      "changePct": round(chg/prev*100,2) if prev else 0,
+                      "weekChangePct": round((price-week)/week*100,2) if week else 0,
+                      "volume": round(int(rows[-1][1].replace(",",""))/1000),
+                      "pe": float(rows[-1][8]) if rows[-1][8].replace(".","").isdigit() else None,
+                  }
+                  time.sleep(0.8)
+
+                  # 法人
+                  try:
+                      d2 = fetch(f"https://www.twse.com.tw/fund/T86?response=json&date={today()}&selectType=ALLBUT0999")
+                      row = next((r for r in d2.get("data",[]) if r[0]==sym), None)
+                      if row:
+                          pi = lambda v: round(int(v.replace(",","").strip() or "0")/1000)
+                          f,i,de = pi(row[4]),pi(row[7]),pi(row[10])
+                          result[sym].update({"foreign":f,"investment":i,"dealer":de,
+                              "foreignDays":1 if f>0 else -1,
+                              "investmentDays":1 if i>0 else -1,
+                              "dealerDays":1 if de>0 else -1})
+                  except: pass
+                  time.sleep(0.8)
+
+                  # 資券
+                  try:
+                      d3 = fetch(f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={today()}&selectType=ALL")
+                      row = next((r for r in d3.get("data",[]) if r[0]==sym), None)
+                      if row:
+                          pi = lambda v: round(int(v.replace(",","").strip() or "0")/1000)
+                          mb,pm = pi(row[5]),pi(row[6])
+                          sb,ps = pi(row[10]),pi(row[11])
+                          smr = round(sb/mb*100,1) if mb else 0
+                          mur = min(round(mb/(mb+80000)*100,1),100) if mb else 0
+                          result[sym].update({"marginBalance":mb,"marginChange":mb-pm,
+                              "shortBalance":sb,"shortChange":sb-ps,
+                              "marginUtilRate":mur,"shortMarginRatio":smr})
+                  except: pass
+
+                  # 籌碼評分
+                  f = result[sym].get("foreign",0)
+                  i = result[sym].get("investment",0)
+                  fd = result[sym].get("foreignDays",0)
+                  mu = result[sym].get("marginUtilRate",0)
+                  sm = result[sym].get("shortMarginRatio",0)
+                  score = 50
+                  score += max(-15,min(15,(f or 0)/600))
+                  score += max(-10,min(10,(i or 0)/250))
+                  score += max(-10,min(10,(fd or 0)*2))
+                  if mu > 70: score -= 8
+                  if sm > 10: score += 5
+                  score = max(5,min(95,round(score)))
+                  bias = next(b for t,b in [(75,"強多"),(55,"偏多"),(40,"中性"),(25,"偏空"),(0,"強空")] if score>=t)
+                  result[sym].update({"institutionalScore":score,"institutionalBias":bias,
+                      "pbr":None,"_updated":datetime.datetime.now().isoformat(),"_source":"twse"})
+                  print(f"  OK {sym} price={price}")
+                  time.sleep(0.5)
+
+              except Exception as e:
+                  print(f"  ERROR {sym}: {e}")
+
+          with open("data.json","w",encoding="utf-8") as f:
+              json.dump(result, f, ensure_ascii=False, indent=2)
+          print(f"Done. {len(result)} stocks written to data.json")
+          PYEOF
+
+      - name: Commit data.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data.json
+          git diff --staged --quiet || git commit -m "📈 $(date '+%Y-%m-%d %H:%M') 更新股市資料"
+          git push
